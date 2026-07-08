@@ -212,7 +212,7 @@ def _fmt_date(s):
     except: return s
 
 def _fred(series):
-    txt=_http_get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}")
+    txt=_http_get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}", timeout=25)
     rows=[l.split(",") for l in txt.strip().splitlines()[1:] if l]
     return [(d, float(v)) for d,v in rows if v not in ("",".","NA")]
 
