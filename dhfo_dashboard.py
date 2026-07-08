@@ -194,6 +194,91 @@ def load_manual():
     return {}
 
 # ----------------------------------------------------------------------------
+# Live macro fetch (runs at build time). Works where the runner has open
+# internet (e.g. GitHub Actions); falls back silently to macro_values.json
+# for any source that is blocked or slow (e.g. a restricted sandbox).
+# ----------------------------------------------------------------------------
+def _http_get(url, headers=None, timeout=8, opener=None):
+    import urllib.request
+    req=urllib.request.Request(url, headers=headers or {"User-Agent":"Mozilla/5.0"})
+    o=opener or urllib.request
+    return o.urlopen(req, timeout=timeout).read().decode("utf-8","replace")
+
+def _fmt_date(s):
+    try:
+        return dt.datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d %b %Y")
+    except: return s
+
+def _fred(series):
+    txt=_http_get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}")
+    rows=[l.split(",") for l in txt.strip().splitlines()[1:] if l]
+    return [(d, float(v)) for d,v in rows if v not in ("",".","NA")]
+
+def _fred_latest(series):
+    v=_fred(series);  return (v[-1][0], v[-1][1]) if v else None
+
+def _fred_yoy(series):
+    v=_fred(series)
+    if len(v)<13: return None
+    return (v[-1][0], (v[-1][1]/v[-13][1]-1)*100.0)
+
+def fetch_live_macro():
+    """Return {indicator_name: {'value':x,'as_of':'..'}} for what we can fetch."""
+    ov={}
+    def put(name, res, nd=2):
+        if res:
+            d,val=res; ov[name]={"value":round(val,nd),"as_of":_fmt_date(d)}
+    # ---- FRED (open, no key) ----
+    fred_jobs=[
+        ("US 2Y Treasury",     lambda:_fred_latest("DGS2"), 2),
+        ("US 20Y Treasury",    lambda:_fred_latest("DGS20"),2),
+        ("10-yr TIPS breakeven",lambda:_fred_latest("T10YIE"),2),
+        ("ICE BofA HY OAS",    lambda:_fred_latest("BAMLH0A0HYM2"),2),
+        ("US M2 Money Stock",  lambda:_fred_latest("M2SL"),0),
+        ("US CPI (Y-o-Y)",     lambda:_fred_yoy("CPIAUCSL"),2),
+        ("Consumer Price Index",lambda:_fred_yoy("INDCPIALLMINMEI"),2),  # India CPI YoY
+        ("10-yr G-Sec Yield",  lambda:_fred_latest("IRLTLT01INM156N"),2),# India 10Y
+    ]
+    fred_alive=True
+    for name,fn,nd in fred_jobs:
+        if not fred_alive: break          # source unreachable -> stop probing
+        try: put(name, fn(), nd)
+        except Exception: fred_alive=False
+    # ---- NSE (needs cookie handshake; may be blocked on some hosts) ----
+    try:
+        import urllib.request, http.cookiejar
+        cj=http.cookiejar.CookieJar()
+        op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        h={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+           "Accept":"application/json,text/html","Accept-Language":"en-US,en;q=0.9",
+           "Referer":"https://www.nseindia.com/"}
+        _http_get("https://www.nseindia.com/", headers=h, opener=op, timeout=8)
+        today=dt.datetime.now(IST).strftime("%d %b %Y")
+        idx=json.loads(_http_get("https://www.nseindia.com/api/allIndices", headers=h, opener=op, timeout=8))
+        for row in idx.get("data",[]):
+            if (row.get("index") or row.get("indexSymbol"))=="NIFTY 50":
+                for nm,key in [("Nifty P/E","pe"),("Nifty P/B","pb"),("Nifty Div Yield","dy")]:
+                    try: ov[nm]={"value":round(float(row[key]),2),"as_of":today}
+                    except Exception: pass
+                break
+        fd=json.loads(_http_get("https://www.nseindia.com/api/fiidiiTradeReact", headers=h, opener=op, timeout=8))
+        for row in fd:
+            cat=(row.get("category") or "").upper()
+            try: net=round(float(row.get("netValue")))
+            except Exception: continue
+            d=_fmt_date_nse(row.get("date"))
+            if "FII" in cat or "FPI" in cat: ov["FII net (cash)"]={"value":net,"as_of":d}
+            elif "DII" in cat:               ov["DII net (cash)"]={"value":net,"as_of":d}
+    except Exception: pass
+    return ov
+
+def _fmt_date_nse(s):
+    for f in ("%d-%b-%Y","%d %b %Y","%Y-%m-%d"):
+        try: return dt.datetime.strptime((s or "").strip(), f).strftime("%d %b %Y")
+        except Exception: pass
+    return (s or "").strip() or dt.datetime.now(IST).strftime("%d %b %Y")
+
+# ----------------------------------------------------------------------------
 def gather():
     import yfinance as yf
     hist = {}
@@ -210,6 +295,12 @@ def gather():
         print("yahoo download error:", e)
 
     manual = load_manual()
+    try:
+        overrides = fetch_live_macro()
+    except Exception:
+        overrides = {}
+    if overrides:
+        print(f"live macro fetched: {len(overrides)} rows -> {sorted(overrides)}")
     rows = []
     for d in IND:
         if "section" in d:
@@ -251,8 +342,8 @@ def gather():
                 else: r["value"]=None; r["source"]="na"
             else:
                 r["value"]=None; r["source"]="na"
-        else:  # manual
-            mv = manual.get(d["name"])
+        else:  # manual — prefer freshly-fetched value, fall back to stored JSON
+            mv = overrides.get(d["name"]) or manual.get(d["name"])
             if mv and mv.get("value") is not None:
                 r["value"]=mv["value"]; r["asof"]=mv.get("as_of","")
                 r["source"]="manual"
