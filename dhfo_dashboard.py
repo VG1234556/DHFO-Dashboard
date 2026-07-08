@@ -21,6 +21,7 @@ MANUAL_JSON = os.path.join(HERE, "macro_values.json")
 OUT_HTML    = os.path.join(HERE, "DHFO.html")
 OUT_INDEX   = os.path.join(HERE, "index.html")   # for GitHub Pages hosting
 RELOAD_SECS = int(os.environ.get("DHFO_RELOAD_SECS", "30"))  # 0 = no auto-reload
+FETCH_DIAG = ""  # short live-fetch diagnostic, surfaced as a <meta> tag
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
@@ -201,8 +202,9 @@ def load_manual():
 def _http_get(url, headers=None, timeout=8, opener=None):
     import urllib.request
     req=urllib.request.Request(url, headers=headers or {"User-Agent":"Mozilla/5.0"})
-    o=opener or urllib.request
-    return o.urlopen(req, timeout=timeout).read().decode("utf-8","replace")
+    if opener is not None:                       # OpenerDirector uses .open(), not .urlopen()
+        return opener.open(req, timeout=timeout).read().decode("utf-8","replace")
+    return urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8","replace")
 
 def _fmt_date(s):
     try:
@@ -223,8 +225,8 @@ def _fred_yoy(series):
     return (v[-1][0], (v[-1][1]/v[-13][1]-1)*100.0)
 
 def fetch_live_macro():
-    """Return {indicator_name: {'value':x,'as_of':'..'}} for what we can fetch."""
-    ov={}
+    """Return ({indicator_name: {'value':x,'as_of':'..'}}, [errors])."""
+    ov={}; errs=[]
     def put(name, res, nd=2):
         if res:
             d,val=res; ov[name]={"value":round(val,nd),"as_of":_fmt_date(d)}
@@ -243,7 +245,8 @@ def fetch_live_macro():
     for name,fn,nd in fred_jobs:
         if not fred_alive: break          # source unreachable -> stop probing
         try: put(name, fn(), nd)
-        except Exception: fred_alive=False
+        except Exception as e:
+            errs.append(f"FRED({name}):{type(e).__name__}:{str(e)[:70]}"); fred_alive=False
     # ---- NSE (needs cookie handshake; may be blocked on some hosts) ----
     try:
         import urllib.request, http.cookiejar
@@ -269,8 +272,9 @@ def fetch_live_macro():
             d=_fmt_date_nse(row.get("date"))
             if "FII" in cat or "FPI" in cat: ov["FII net (cash)"]={"value":net,"as_of":d}
             elif "DII" in cat:               ov["DII net (cash)"]={"value":net,"as_of":d}
-    except Exception: pass
-    return ov
+    except Exception as e:
+        errs.append(f"NSE:{type(e).__name__}:{str(e)[:70]}")
+    return ov, errs
 
 def _fmt_date_nse(s):
     for f in ("%d-%b-%Y","%d %b %Y","%Y-%m-%d"):
@@ -295,12 +299,14 @@ def gather():
         print("yahoo download error:", e)
 
     manual = load_manual()
+    global FETCH_DIAG
+    ferrs=[]
     try:
-        overrides = fetch_live_macro()
-    except Exception:
-        overrides = {}
-    if overrides:
-        print(f"live macro fetched: {len(overrides)} rows -> {sorted(overrides)}")
+        overrides, ferrs = fetch_live_macro()
+    except Exception as e:
+        overrides = {}; ferrs=[f"outer:{type(e).__name__}:{str(e)[:70]}"]
+    FETCH_DIAG = (f"overrides={len(overrides)} " + (" | ".join(ferrs) if ferrs else "ok")).replace('"',"'")
+    print("FETCH_DIAG:", FETCH_DIAG)
     rows = []
     for d in IND:
         if "section" in d:
@@ -435,6 +441,7 @@ def render(rows):
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 {reload_tag}
+<meta name="dhfo-fetch" content="{FETCH_DIAG}">
 <title>DHFO</title>
 <style>
 :root{{--green:{GREEN};--gold:{GOLD};--teal:{TEAL};--pos:{POS};--neg:{NEG};
